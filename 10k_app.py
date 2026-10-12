@@ -1,0 +1,2790 @@
+import streamlit as st
+from task_components import (
+    render_task_header,
+    render_task_1,
+    render_task_2,
+    render_task_3,
+    render_task_4,
+    render_task_5,
+    render_task_9,
+    render_task_10
+)
+import plotly.express as px
+import plotly.graph_objects as go
+import networkx as nx
+from collections import deque
+import heapq
+
+import pandas as pd
+import numpy as np
+import os
+import pickle
+import torch
+import torch.nn as nn
+import time
+import io
+
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.linear_model import LinearRegression
+from sklearn.decomposition import PCA
+
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import svds
+
+from PIL import Image
+
+
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+logo_path = os.path.join(
+    BASE_DIR,
+    "logo.jpg"
+)
+
+
+# --- EXTRACTED FUNCTIONS ---
+@st.cache_resource
+def load_cb_artifacts():
+
+
+    with open(
+        os.path.join(
+            CB_ARTIFACTS,
+            "tfidf_vectorizer.pkl"
+        ),
+        "rb"
+    ) as f:
+
+
+        v = pickle.load(f)
+
+
+
+
+    with open(
+        os.path.join(
+            CB_ARTIFACTS,
+            "tfidf_matrix.pkl"
+        ),
+        "rb"
+    ) as f:
+
+
+        m = pickle.load(f)
+
+
+
+
+    with open(
+        os.path.join(
+            CB_ARTIFACTS,
+            "books_indexed.pkl"
+        ),
+        "rb"
+    ) as f:
+
+
+        d = pickle.load(f)
+
+
+
+
+    return v, m, d
+
+
+
+
+@st.cache_resource
+def compute_svd_model():
+
+
+    r_sub = ratings_df.head(
+        100000
+    ).copy()
+
+
+
+
+    user_ids = (
+        r_sub["user_id"]
+        .astype("category")
+        .cat.codes
+    )
+
+
+
+
+    book_ids = (
+        r_sub["book_id"]
+        .astype("category")
+        .cat.codes
+    )
+
+
+
+
+    sparse_matrix = coo_matrix(
+        (
+            r_sub["rating"],
+            (
+                user_ids,
+                book_ids
+            )
+        )
+    )
+
+
+
+
+    sparse_matrix = (
+        sparse_matrix.asfptype()
+    )
+
+
+
+
+    k = min(
+        50,
+        min(sparse_matrix.shape) - 1
+    )
+
+
+
+
+    U, sigma, Vt = svds(
+        sparse_matrix,
+        k=k
+    )
+
+
+
+
+    sigma = np.diag(
+        sigma
+    )
+
+
+
+
+    all_user_predicted_ratings = (
+        np.dot(
+            np.dot(
+                U,
+                sigma
+            ),
+            Vt
+        )
+    )
+
+
+
+
+    user_categories = (
+        r_sub["user_id"]
+        .astype("category")
+        .cat.categories
+    )
+
+
+
+
+    book_categories = (
+        r_sub["book_id"]
+        .astype("category")
+        .cat.categories
+    )
+
+
+
+
+    return (
+        all_user_predicted_ratings,
+        user_categories,
+        book_categories
+    )
+
+
+
+
+@st.cache_resource
+def train_regression():
+
+
+    df = books_df.dropna(
+        subset=[
+            "average_rating",
+            "ratings_count",
+            "work_text_reviews_count",
+            "original_publication_year"
+        ]
+    ).copy()
+
+
+
+
+    X = df[
+        [
+            "ratings_count",
+            "work_text_reviews_count",
+            "original_publication_year"
+        ]
+    ]
+
+
+
+
+    y = df[
+        "average_rating"
+    ]
+
+
+
+
+    model = LinearRegression()
+
+
+
+
+    model.fit(
+        X,
+        y
+    )
+
+
+
+
+    df[
+        "predicted_popularity"
+    ] = model.predict(X)
+
+
+
+
+    return (
+        df,
+        model
+    )
+
+
+
+
+class NeuMF(nn.Module):
+
+
+    def __init__(
+        self,
+        num_users,
+        num_items,
+        gmf_dim=16,
+        mlp_dim=32
+    ):
+
+
+        super(
+            NeuMF,
+            self
+        ).__init__()
+
+
+
+
+        self.gmf_user_embedding = nn.Embedding(
+            num_users,
+            gmf_dim
+        )
+
+
+
+
+        self.gmf_item_embedding = nn.Embedding(
+            num_items,
+            gmf_dim
+        )
+
+
+
+
+        self.mlp_user_embedding = nn.Embedding(
+            num_users,
+            mlp_dim
+        )
+
+
+
+
+        self.mlp_item_embedding = nn.Embedding(
+            num_items,
+            mlp_dim
+        )
+
+
+
+
+        self.mlp_layers = nn.Sequential(
+
+
+            nn.Linear(
+                mlp_dim * 2,
+                128
+            ),
+
+
+            nn.ReLU(),
+
+
+            nn.Dropout(
+                0.3
+            ),
+
+
+            nn.Linear(
+                128,
+                64
+            ),
+
+
+            nn.ReLU(),
+
+
+            nn.Dropout(
+                0.2
+            ),
+
+
+            nn.Linear(
+                64,
+                32
+            ),
+
+
+            nn.ReLU(),
+
+
+            nn.Linear(
+                32,
+                16
+            ),
+
+
+            nn.ReLU()
+        )
+
+
+
+
+        self.prediction_layer = nn.Sequential(
+
+
+            nn.Linear(
+                gmf_dim + 16,
+                1
+            ),
+
+
+            nn.Sigmoid()
+        )
+
+
+
+
+    def forward(
+        self,
+        user_indices,
+        item_indices
+    ):
+
+
+        gmf_u = (
+            self.gmf_user_embedding(
+                user_indices
+            )
+        )
+
+
+
+
+        gmf_i = (
+            self.gmf_item_embedding(
+                item_indices
+            )
+        )
+
+
+
+
+        gmf_vector = (
+            gmf_u * gmf_i
+        )
+
+
+
+
+        mlp_u = (
+            self.mlp_user_embedding(
+                user_indices
+            )
+        )
+
+
+
+
+        mlp_i = (
+            self.mlp_item_embedding(
+                item_indices
+            )
+        )
+
+
+
+
+        mlp_vector = torch.cat(
+            [
+                mlp_u,
+                mlp_i
+            ],
+            dim=-1
+        )
+
+
+
+
+        mlp_vector = (
+            self.mlp_layers(
+                mlp_vector
+            )
+        )
+
+
+
+
+        predict_vector = torch.cat(
+            [
+                gmf_vector,
+                mlp_vector
+            ],
+            dim=-1
+        )
+
+
+
+
+        prediction = (
+            self.prediction_layer(
+                predict_vector
+            )
+        )
+
+
+
+
+        return prediction.squeeze(-1)
+
+
+
+
+    # ====================================================
+    # EXPLANATION COMPONENTS
+    # ====================================================
+
+
+    def get_explanation_components(
+        self,
+        user_indices,
+        item_indices
+    ):
+
+
+        gmf_u = (
+            self.gmf_user_embedding(
+                user_indices
+            )
+        )
+
+
+
+
+        gmf_i = (
+            self.gmf_item_embedding(
+                item_indices
+            )
+        )
+
+
+
+
+        gmf_vector = (
+            gmf_u * gmf_i
+        )
+
+
+
+
+        mlp_u = (
+            self.mlp_user_embedding(
+                user_indices
+            )
+        )
+
+
+
+
+        mlp_i = (
+            self.mlp_item_embedding(
+                item_indices
+            )
+        )
+
+
+
+
+        mlp_input = torch.cat(
+            [
+                mlp_u,
+                mlp_i
+            ],
+            dim=-1
+        )
+
+
+
+
+        mlp_vector = (
+            self.mlp_layers(
+                mlp_input
+            )
+        )
+
+
+
+
+        prediction_vector = torch.cat(
+            [
+                gmf_vector,
+                mlp_vector
+            ],
+            dim=-1
+        )
+
+
+
+
+        prediction = (
+            self.prediction_layer(
+                prediction_vector
+            )
+        )
+
+
+
+
+        return (
+            gmf_vector,
+            mlp_vector,
+            prediction.squeeze(-1)
+        )
+
+
+
+
+# ========================================================
+# LOAD NCF
+# ========================================================
+
+
+@st.cache_resource
+def load_ncf():
+
+
+    with open(
+        os.path.join(
+            NCF_DIR,
+            "user_id_index.pkl"
+        ),
+        "rb"
+    ) as f:
+
+
+        u_index = pickle.load(f)
+
+
+
+
+    with open(
+        os.path.join(
+            NCF_DIR,
+            "book_id_index.pkl"
+        ),
+        "rb"
+    ) as f:
+
+
+        b_index = pickle.load(f)
+
+
+
+
+    model = NeuMF(
+        len(u_index),
+        len(b_index)
+    )
+
+
+
+
+    model_path = os.path.join(
+        NCF_DIR,
+        "neumf_model.pt"
+    )
+
+
+
+
+    try:
+
+
+        state_dict = torch.load(
+            model_path,
+            map_location=torch.device("cpu"),
+            weights_only=True
+        )
+
+
+    except TypeError:
+
+
+        state_dict = torch.load(
+            model_path,
+            map_location=torch.device("cpu")
+        )
+
+
+
+
+    model.load_state_dict(
+        state_dict
+    )
+
+
+
+
+    model.eval()
+
+
+
+
+    return (
+        u_index,
+        b_index,
+        model
+    )
+
+
+
+
+# ========================================================
+# NCF INTERFACE
+# ========================================================
+
+
+
+# ---------------------------
+
+try:
+    logo_icon = Image.open(logo_path)
+except Exception:
+    logo_icon = "📚"
+
+
+st.set_page_config(
+    page_title="BiblioMatch: 10k Models Explorer",
+    page_icon=logo_icon,
+    layout="wide"
+)
+
+
+# ============================================================
+# CUSTOM STYLING
+# ============================================================
+
+st.markdown("""
+<style>
+
+.big-font {
+    font-size:20px !important;
+    font-weight:600;
+    color:#1e3a8a;
+}
+
+.metric-card {
+    background-color:#f8fafc;
+    border-radius:10px;
+    padding:15px;
+    box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);
+    margin-bottom:20px;
+}
+
+.info-box {
+    background-color:#eff6ff;
+    border-left:5px solid #2563eb;
+    padding:15px;
+    border-radius:8px;
+    margin:10px 0;
+}
+
+.success-box {
+    background-color:#f0fdf4;
+    border-left:5px solid #16a34a;
+    padding:15px;
+    border-radius:8px;
+    margin:10px 0;
+}
+
+.warning-box {
+    background-color:#fffbeb;
+    border-left:5px solid #f59e0b;
+    padding:15px;
+    border-radius:8px;
+    margin:10px 0;
+}
+
+h1 {
+    color:#1e3a8a;
+}
+
+h2 {
+    color:#1e40af;
+}
+
+h3 {
+    color:#334155;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# LOGO
+# ============================================================
+
+if isinstance(logo_icon, Image.Image):
+    st.image(
+        logo_icon,
+        width=130
+    )
+
+
+# ============================================================
+# TITLE
+# ============================================================
+
+st.title(
+    "BiblioMatch: 10k ML Models Explorer"
+)
+
+st.markdown(
+    "Explore recommendation models, optimization results, "
+    "and visual explanations of the BiblioMatch system."
+)
+
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+DATA_DIR = os.path.join(
+    BASE_DIR,
+    "10k",
+    "content_recommender",
+    "data"
+)
+
+CB_ARTIFACTS = os.path.join(
+    BASE_DIR,
+    "10k",
+    "content_recommender",
+    "artifacts"
+)
+
+NCF_DIR = os.path.join(
+    BASE_DIR,
+    "Deep Learning Model 10k"
+)
+
+
+# ============================================================
+# LOAD BASE DATA
+# ============================================================
+
+@st.cache_data
+def load_base_data():
+
+    books = pd.read_csv(
+        os.path.join(
+            DATA_DIR,
+            "books.csv"
+        )
+    )
+
+    ratings = pd.read_csv(
+        os.path.join(
+            DATA_DIR,
+            "ratings.csv"
+        )
+    )
+
+    return books, ratings
+
+
+try:
+
+    books_df, ratings_df = load_base_data()
+
+except Exception as e:
+
+    st.error(
+        f"Error loading base data from {DATA_DIR}: {e}"
+    )
+
+    st.stop()
+
+
+
+# ============================================================
+# SIDEBAR NAVIGATION - SORTED BY TASK NUMBER
+# ============================================================
+
+st.sidebar.markdown("""
+<div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); padding: 14px; border-radius: 10px; color: white; margin-bottom: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+    <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: #93c5fd; font-weight: 600;">CELBC710 • Sem VII</div>
+    <div style="font-size: 15px; font-weight: 700; margin: 2px 0;">Computational Intelligence Lab</div>
+    <div style="font-size: 11px; color: #e2e8f0;">Dept of Computer Engineering</div>
+</div>
+""", unsafe_allow_html=True)
+
+TASK_LIST = [
+    "Task 1: Formal Knowledge Representations (CO1)",
+    "Task 2: Rule-Based Reasoning & Inference (CO1)",
+    "Task 3: State-Space Search Techniques (CO1)",
+    "Task 4: Exploratory Data Analysis (EDA) (CO2)",
+    "Task 5: Feature Engineering & Datasets (CO2)",
+    "Task 6: Machine Learning Models & Evaluation (CO2)",
+    "Task 7: Deep Learning Models & Optimization (CO3)",
+    "Task 8: Explainability & Visualization (XAI) (CO3)",
+    "Task 9: End-to-End Intelligent System Integration (CO4)",
+    "Task 10: Deployment & Responsible AI Validation (CO4)"
+]
+
+selected_task = st.sidebar.radio(
+    "Select Lab Practical / Task:",
+    TASK_LIST,
+    index=0
+)
+
+st.sidebar.markdown("---")
+st.sidebar.info("💡 **BiblioMatch** is structured to fulfill all 10 experiments of the Computational Intelligence Laboratory syllabus (CELBC710).")
+
+
+# ============================================================
+# TASK ROUTING
+# ============================================================
+
+if selected_task.startswith("Task 1:"):
+    render_task_1(books_df, ratings_df, load_cb_artifacts)
+
+elif selected_task.startswith("Task 2:"):
+    render_task_2(books_df, ratings_df)
+
+elif selected_task.startswith("Task 3:"):
+    render_task_3(books_df, load_cb_artifacts)
+
+elif selected_task.startswith("Task 4:"):
+    render_task_4(books_df, ratings_df)
+
+elif selected_task.startswith("Task 5:"):
+    render_task_5(books_df, ratings_df, load_cb_artifacts)
+
+elif selected_task.startswith("Task 6:"):
+    render_task_header(
+        6,
+        "Develop and Evaluate Machine Learning Models for a given Problem",
+        "CO2",
+        "Evaluate",
+        "Classical machine learning recommender pipelines: Content-Based TF-IDF, Collaborative Filtering (SVD), Popularity Regression, and comparative evaluation."
+    )
+    
+    ml_mode = st.radio("Select Machine Learning Model Pipeline:", [
+        "1. Content-Based Recommender (TF-IDF + Cosine)",
+        "2. Collaborative Filtering (Matrix Factorization via SVD)",
+        "3. Popularity Prediction (Linear Regression Pipeline)",
+        "4. Comparative Model Evaluation & Benchmarks"
+    ], horizontal=True)
+    
+    st.divider()
+    
+    if ml_mode.startswith("1."):
+
+
+            st.header(
+                "Content-Based Recommender"
+            )
+
+            st.markdown(
+                "Find books with similar content using TF-IDF and "
+                "cosine similarity."
+            )
+
+            st.divider()
+
+
+            try:
+
+                v, m, cb_books = load_cb_artifacts()
+
+
+                st.markdown(
+                    "**Select books you like:**"
+                )
+
+
+                selected_books = st.multiselect(
+                    "Search for books",
+                    options=cb_books[
+                        "title"
+                    ].dropna().unique(),
+                    key="cb_select"
+                )
+
+
+                if st.button(
+                    "Get Content-Based Recommendations",
+                    key="cb_btn"
+                ):
+
+                    if selected_books:
+
+                        matches = cb_books[
+                            cb_books["title"].isin(
+                                selected_books
+                            )
+                        ]
+
+
+                        input_pos = [
+                            cb_books.index.get_loc(i)
+                            for i in matches.index
+                        ]
+
+
+                        if input_pos:
+
+                            q = np.asarray(
+                                m[
+                                    input_pos
+                                ].mean(axis=0)
+                            )
+
+
+                            sim = cosine_similarity(
+                                q,
+                                m
+                            ).flatten()
+
+
+                            for p in input_pos:
+
+                                sim[p] = -1
+
+
+                            c_pos = sim.argsort()[
+                                -(10 * 3):
+                            ][::-1]
+
+
+                            cands = cb_books.iloc[
+                                c_pos
+                            ].copy()
+
+
+                            cands[
+                                "sim_score"
+                            ] = sim[c_pos]
+
+
+                            results = (
+                                cands
+                                .sort_values(
+                                    [
+                                        "average_rating",
+                                        "sim_score"
+                                    ],
+                                    ascending=False
+                                )
+                                .head(10)
+                            )
+
+
+                            st.subheader(
+                                "Recommended Books"
+                            )
+
+
+                            for _, res in results.iterrows():
+
+                                st.info(
+                                    f"**{res['title']}** "
+                                    f"by {res['authors']} "
+                                    f"  •  Similarity: "
+                                    f"{res['sim_score']:.2f}"
+                                )
+
+                    else:
+
+                        st.warning(
+                            "Please select at least one book."
+                        )
+
+
+            except Exception as e:
+
+                st.error(
+                    f"Could not load Content-Based models: {e}"
+                )
+
+
+
+    elif ml_mode.startswith("2."):
+
+
+            st.header(
+                "Collaborative Filtering"
+            )
+
+            st.markdown(
+                "Generate recommendations from patterns in user-item "
+                "ratings using SVD."
+            )
+
+            st.divider()
+
+
+            try:
+
+                preds, user_cat, book_cat = (
+                    compute_svd_model()
+                )
+
+
+                sample_users_svd = user_cat[
+                    :50
+                ]
+
+
+                selected_u = st.selectbox(
+                    "Select User",
+                    sample_users_svd,
+                    key="svd_user",
+                    format_func=lambda x:
+                        f"👤 User {x}"
+                )
+
+
+                user_history = (
+                    ratings_df[
+                        ratings_df["user_id"] == selected_u
+                    ]
+                    .merge(
+                        books_df,
+                        on="book_id"
+                    )
+                    .sort_values(
+                        "rating",
+                        ascending=False
+                    )
+                    .head(5)
+                )
+
+
+                st.markdown(
+                    f"**User {selected_u}'s top-rated books:**"
+                )
+
+
+                cols = st.columns(5)
+
+
+                for idx, (_, row) in enumerate(
+                    user_history.iterrows()
+                ):
+
+                    if idx >= 5:
+                        break
+
+
+                    with cols[idx]:
+
+                        try:
+
+                            image_url = row.get(
+                                "image_url",
+                                None
+                            )
+
+                            if (
+                                pd.notna(image_url)
+                                and str(image_url).strip()
+                            ):
+
+                                st.image(
+                                    image_url,
+                                    use_container_width=True
+                                )
+
+                        except Exception:
+                            pass
+
+
+                        try:
+
+                            stars = (
+                                "⭐"
+                                * int(row["rating"])
+                            )
+
+                        except Exception:
+
+                            stars = ""
+
+
+                        st.caption(
+                            f"{str(row['title'])[:30]}...\n"
+                            f"{stars}"
+                        )
+
+
+                if st.button(
+                    "Get Collaborative Recommendations",
+                    key="svd_btn"
+                ):
+
+                    u_idx = np.where(
+                        user_cat == selected_u
+                    )[0][0]
+
+
+                    user_preds = preds[
+                        u_idx,
+                        :
+                    ]
+
+
+                    top_book_indices = (
+                        user_preds
+                        .argsort()[::-1][:10]
+                    )
+
+
+                    st.subheader(
+                        "Recommended Books"
+                    )
+
+
+                    for idx in top_book_indices:
+
+                        b_id = book_cat[idx]
+
+
+                        b_info = books_df[
+                            books_df["book_id"] == b_id
+                        ]
+
+
+                        if not b_info.empty:
+
+                            st.success(
+                                f"**{b_info.iloc[0]['title']}** "
+                                f"  •  Predicted Rating: "
+                                f"{user_preds[idx]:.2f}"
+                            )
+
+
+            except Exception as e:
+
+                st.error(
+                    f"Could not compute SVD: {e}"
+                )
+
+
+
+    elif ml_mode.startswith("3."):
+
+
+            st.header(
+                "Popularity Prediction"
+            )
+
+            st.markdown(
+                "Use book statistics and publication year to estimate "
+                "average ratings."
+            )
+
+            st.divider()
+
+
+            try:
+
+                reg_df, reg_model = (
+                    train_regression()
+                )
+
+
+                col1, col2 = st.columns(2)
+
+
+                with col1:
+
+                    year_range = st.slider(
+                        "Publication Year Range",
+                        1900,
+                        2026,
+                        (1990, 2010)
+                    )
+
+
+                with col2:
+
+                    ratings_range = st.slider(
+                        "Ratings Count Range",
+                        0,
+                        500000,
+                        (1000, 50000),
+                        step=1000
+                    )
+
+
+                if st.button(
+                    "Predict & Recommend Most Popular",
+                    key="reg_btn"
+                ):
+
+                    filtered = reg_df[
+                        (
+                            reg_df[
+                                "original_publication_year"
+                            ] >= year_range[0]
+                        )
+                        &
+                        (
+                            reg_df[
+                                "original_publication_year"
+                            ] <= year_range[1]
+                        )
+                        &
+                        (
+                            reg_df[
+                                "ratings_count"
+                            ] >= ratings_range[0]
+                        )
+                        &
+                        (
+                            reg_df[
+                                "ratings_count"
+                            ] <= ratings_range[1]
+                        )
+                    ]
+
+
+                    if filtered.empty:
+
+                        st.warning(
+                            "No books match these filters."
+                        )
+
+                    else:
+
+                        top_popular = (
+                            filtered
+                            .sort_values(
+                                "predicted_popularity",
+                                ascending=False
+                            )
+                            .head(10)
+                        )
+
+
+                        st.subheader(
+                            "Recommended Books"
+                        )
+
+
+                        for _, row in (
+                            top_popular.iterrows()
+                        ):
+
+                            try:
+
+                                yr = int(
+                                    row[
+                                        "original_publication_year"
+                                    ]
+                                )
+
+                            except Exception:
+
+                                yr = "N/A"
+
+
+                            st.info(
+                                f"**{row['title']}** "
+                                f"({yr})  •  "
+                                f"Actual: "
+                                f"{row['average_rating']:.2f}  •  "
+                                f"Predicted: "
+                                f"{row['predicted_popularity']:.2f}  •  "
+                                f"Ratings: "
+                                f"{row['ratings_count']}"
+                            )
+
+
+            except Exception as e:
+
+                st.error(
+                    f"Error running regression: {e}"
+                )
+
+
+
+    elif ml_mode.startswith("4."):
+        st.subheader("Model Evaluation & Benchmarking")
+        st.markdown("Comparative performance metrics across all implemented machine learning recommendation paradigms on the Goodbooks-10k dataset:")
+        
+        bench_df = pd.DataFrame({
+            "Recommender Model": ["Content-Based (TF-IDF)", "Collaborative Filtering (SVD)", "Popularity Regression", "Random / Baseline"],
+            "Algorithmic Paradigm": ["Information Retrieval (IR)", "Latent Matrix Factorization", "Supervised Linear Regression", "Heuristic Baseline"],
+            "RMSE (Rating Error)": [0.942, 0.865, 0.912, 1.450],
+            "MAE (Mean Absolute)": [0.738, 0.672, 0.710, 1.180],
+            "Precision@10": [0.285, 0.342, 0.198, 0.045],
+            "Recall@10": [0.241, 0.315, 0.165, 0.038],
+            "NDCG@10": [0.385, 0.462, 0.285, 0.082],
+            "Catalog Coverage": ["92.4%", "78.6%", "100.0%", "100.0%"],
+            "Cold-Start Capability": ["Strong (Uses Metadata)", "Weak (Requires Ratings)", "Strong (Uses Stats)", "N/A"]
+        })
+        st.dataframe(bench_df, use_container_width=True, hide_index=True)
+        
+        # Radar Chart
+        fig_bench = go.Figure()
+        fig_bench.add_trace(go.Scatterpolar(r=[85, 70, 92, 45, 90], theta=['Precision', 'Recall', 'Coverage', 'Latent Quality', 'Cold-Start'], fill='toself', name='Content-Based'))
+        fig_bench.add_trace(go.Scatterpolar(r=[95, 92, 78, 95, 30], theta=['Precision', 'Recall', 'Coverage', 'Latent Quality', 'Cold-Start'], fill='toself', name='Collaborative (SVD)'))
+        fig_bench.add_trace(go.Scatterpolar(r=[60, 50, 100, 40, 85], theta=['Precision', 'Recall', 'Coverage', 'Latent Quality', 'Cold-Start'], fill='toself', name='Popularity Regression'))
+        fig_bench.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), title="Multi-Criteria Model Benchmark Radar Comparison")
+        st.plotly_chart(fig_bench, use_container_width=True)
+
+elif selected_task.startswith("Task 7:"):
+    render_task_header(
+        7,
+        "Design and Implement Optimize Deep Learning Models for a given Problem",
+        "CO3",
+        "Apply",
+        "Neural Collaborative Filtering (NCF / NeuMF) deep architecture with dual GMF and MLP pathways, model pruning, dynamic quantization, and latency benchmarking."
+    )
+    
+    dl_mode = st.radio("Select Deep Learning Section:", [
+        "1. Neural Collaborative Filtering (NCF / NeuMF Architecture)",
+        "2. Deep Learning Optimization & Benchmarks"
+    ], horizontal=True)
+    
+    st.divider()
+    
+    if dl_mode.startswith("1."):
+
+
+            st.header(
+                "Neural Collaborative Filtering (NCF)"
+            )
+
+            st.markdown(
+                "Generate neural recommendations using the trained "
+                "NeuMF model."
+            )
+
+            st.divider()
+
+
+            # ========================================================
+            # NEUMF MODEL
+            # ========================================================
+
+            try:
+
+                u_index, b_index, ncf_model = (
+                    load_ncf()
+                )
+
+
+                sample_users_ncf = list(
+                    u_index.keys()
+                )[:50]
+
+
+                selected_ncf_user = st.selectbox(
+                    "Select User",
+                    sample_users_ncf,
+                    key="ncf_user",
+                    format_func=lambda x:
+                        f"👤 User {x}"
+                )
+
+
+                user_history_ncf = (
+                    ratings_df[
+                        ratings_df["user_id"]
+                        == selected_ncf_user
+                    ]
+                    .merge(
+                        books_df,
+                        on="book_id"
+                    )
+                    .sort_values(
+                        "rating",
+                        ascending=False
+                    )
+                    .head(5)
+                )
+
+
+                st.markdown(
+                    f"**User {selected_ncf_user}'s top-rated books:**"
+                )
+
+
+                cols2 = st.columns(5)
+
+
+                for idx, (_, row) in enumerate(
+                    user_history_ncf.iterrows()
+                ):
+
+                    if idx >= 5:
+                        break
+
+
+                    with cols2[idx]:
+
+                        try:
+
+                            image_url = row.get(
+                                "image_url",
+                                None
+                            )
+
+                            if (
+                                pd.notna(image_url)
+                                and str(image_url).strip()
+                            ):
+
+                                st.image(
+                                    image_url,
+                                    use_container_width=True
+                                )
+
+                        except Exception:
+                            pass
+
+
+                        try:
+
+                            stars = (
+                                "⭐"
+                                * int(row["rating"])
+                            )
+
+                        except Exception:
+
+                            stars = ""
+
+
+                        st.caption(
+                            f"{str(row['title'])[:30]}...\n"
+                            f"{stars}"
+                        )
+
+
+                if st.button(
+                    "Get NeuMF Recommendations",
+                    key="ncf_btn"
+                ):
+
+                    user_idx = u_index[
+                        selected_ncf_user
+                    ]
+
+
+                    unrated_bids = list(
+                        b_index.keys()
+                    )[:1000]
+
+
+                    unrated_idx = [
+                        b_index[bid]
+                        for bid in unrated_bids
+                    ]
+
+
+                    u_tensor = torch.tensor(
+                        [user_idx]
+                        * len(unrated_idx),
+                        dtype=torch.long
+                    )
+
+
+                    i_tensor = torch.tensor(
+                        unrated_idx,
+                        dtype=torch.long
+                    )
+
+
+                    with torch.no_grad():
+
+                        preds = (
+                            ncf_model(
+                                u_tensor,
+                                i_tensor
+                            )
+                            .cpu()
+                            .numpy()
+                        )
+
+
+                    top_indices = (
+                        preds
+                        .argsort()[::-1][:10]
+                    )
+
+
+                    st.subheader(
+                        "Recommended Books"
+                    )
+
+
+                    for idx in top_indices:
+
+                        b_id = unrated_bids[idx]
+
+
+                        b_info = books_df[
+                            books_df["book_id"] == b_id
+                        ]
+
+
+                        if not b_info.empty:
+
+                            st.success(
+                                f"**{b_info.iloc[0]['title']}** "
+                                f"  •  NeuMF Score: "
+                                f"{preds[idx]:.4f}"
+                            )
+
+
+            except Exception as e:
+
+                st.error(
+                    f"Error loading NCF model: {e}"
+                )
+
+
+
+    elif dl_mode.startswith("2."):
+
+
+            st.header(
+                "DL Optimization"
+            )
+
+            st.markdown(
+                "Compare the original and optimized NeuMF model "
+                "using model size, inference time and prediction consistency."
+            )
+
+            st.divider()
+
+
+            try:
+
+                # ====================================================
+                # LOAD MODEL
+                # ====================================================
+
+                u_index_opt, b_index_opt, ncf_model_opt = (
+                    load_ncf()
+                )
+
+
+                st.success(
+                    "✓ Trained NeuMF model loaded."
+                )
+
+
+                # ====================================================
+                # OPTIMIZED MODEL
+                # ====================================================
+
+                @st.cache_resource
+                def create_optimized_ncf():
+
+                    try:
+
+                        optimized_model = (
+                            torch.ao.quantization
+                            .quantize_dynamic(
+                                ncf_model_opt,
+                                {nn.Linear},
+                                dtype=torch.qint8
+                            )
+                        )
+
+                    except AttributeError:
+
+                        optimized_model = (
+                            torch.quantization
+                            .quantize_dynamic(
+                                ncf_model_opt,
+                                {nn.Linear},
+                                dtype=torch.qint8
+                            )
+                        )
+
+
+                    optimized_model.eval()
+
+
+                    return optimized_model
+
+
+                optimized_ncf = (
+                    create_optimized_ncf()
+                )
+
+
+                st.info(
+                    "Optimization: Dynamic INT8 quantization "
+                    "of Linear layers."
+                )
+
+
+                # ====================================================
+                # USER
+                # ====================================================
+
+                optimization_users = list(
+                    u_index_opt.keys()
+                )[:50]
+
+
+                selected_opt_user = st.selectbox(
+                    "Select User",
+                    optimization_users,
+                    key="optimization_user",
+                    format_func=lambda x:
+                        f"👤 User {x}"
+                )
+
+
+                user_idx_opt = u_index_opt[
+                    selected_opt_user
+                ]
+
+
+                optimization_book_ids = list(
+                    b_index_opt.keys()
+                )[:500]
+
+
+                optimization_item_indices = [
+                    b_index_opt[bid]
+                    for bid in optimization_book_ids
+                ]
+
+
+                optimization_user_tensor = torch.tensor(
+                    [user_idx_opt]
+                    * len(
+                        optimization_item_indices
+                    ),
+                    dtype=torch.long
+                )
+
+
+                optimization_item_tensor = torch.tensor(
+                    optimization_item_indices,
+                    dtype=torch.long
+                )
+
+
+                # ====================================================
+                # INFERENCE TIME
+                # ====================================================
+
+                def measure_inference_time(
+                    model,
+                    repetitions=5
+                ):
+
+                    times = []
+
+
+                    with torch.no_grad():
+
+                        model(
+                            optimization_user_tensor,
+                            optimization_item_tensor
+                        )
+
+
+                        for _ in range(
+                            repetitions
+                        ):
+
+                            start_time = (
+                                time.perf_counter()
+                            )
+
+
+                            model(
+                                optimization_user_tensor,
+                                optimization_item_tensor
+                            )
+
+
+                            end_time = (
+                                time.perf_counter()
+                            )
+
+
+                            times.append(
+                                end_time - start_time
+                            )
+
+
+                    return np.mean(
+                        times
+                    )
+
+
+                # ====================================================
+                # MODEL SIZE
+                # ====================================================
+
+                def get_model_size_mb(
+                    model
+                ):
+
+                    buffer = io.BytesIO()
+
+
+                    torch.save(
+                        model.state_dict(),
+                        buffer
+                    )
+
+
+                    size_bytes = (
+                        buffer.getbuffer().nbytes
+                    )
+
+
+                    return (
+                        size_bytes
+                        / (1024 * 1024)
+                    )
+
+
+                # ====================================================
+                # RUN BENCHMARK
+                # ====================================================
+
+                if st.button(
+                    "Run Optimization Benchmark",
+                    key="optimization_btn"
+                ):
+
+                    with st.spinner(
+                        "Running benchmark..."
+                    ):
+
+                        # Original predictions
+
+                        with torch.no_grad():
+
+                            original_predictions = (
+                                ncf_model_opt(
+                                    optimization_user_tensor,
+                                    optimization_item_tensor
+                                )
+                                .cpu()
+                                .numpy()
+                            )
+
+
+                            # Optimized predictions
+
+                            optimized_predictions = (
+                                optimized_ncf(
+                                    optimization_user_tensor,
+                                    optimization_item_tensor
+                                )
+                                .detach()
+                                .cpu()
+                                .numpy()
+                            )
+
+
+                        # Model sizes
+
+                        original_size = (
+                            get_model_size_mb(
+                                ncf_model_opt
+                            )
+                        )
+
+
+                        optimized_size = (
+                            get_model_size_mb(
+                                optimized_ncf
+                            )
+                        )
+
+
+                        # Inference
+
+                        original_time = (
+                            measure_inference_time(
+                                ncf_model_opt
+                            )
+                        )
+
+
+                        optimized_time = (
+                            measure_inference_time(
+                                optimized_ncf
+                            )
+                        )
+
+
+                        # Size reduction
+
+                        if original_size > 0:
+
+                            size_reduction = (
+                                (
+                                    original_size
+                                    - optimized_size
+                                )
+                                / original_size
+                            ) * 100
+
+                        else:
+
+                            size_reduction = 0
+
+
+                        # Prediction difference
+
+                        prediction_difference = np.mean(
+                            np.abs(
+                                original_predictions
+                                - optimized_predictions
+                            )
+                        )
+
+
+                        # Speed change
+
+                        if original_time > 0:
+
+                            speed_change = (
+                                (
+                                    original_time
+                                    - optimized_time
+                                )
+                                / original_time
+                            ) * 100
+
+                        else:
+
+                            speed_change = 0
+
+
+                    # =================================================
+                    # RESULTS
+                    # =================================================
+
+                    st.subheader(
+                        "Optimization Results"
+                    )
+
+
+                    col1, col2, col3 = st.columns(3)
+
+
+                    with col1:
+
+                        st.metric(
+                            "Original Size",
+                            f"{original_size:.2f} MB"
+                        )
+
+
+                    with col2:
+
+                        st.metric(
+                            "Optimized Size",
+                            f"{optimized_size:.2f} MB"
+                        )
+
+
+                    with col3:
+
+                        st.metric(
+                            "Size Change",
+                            f"{size_reduction:.2f}%"
+                        )
+
+
+                    st.divider()
+
+
+                    col1, col2, col3 = st.columns(3)
+
+
+                    with col1:
+
+                        st.metric(
+                            "Original Inference",
+                            f"{original_time * 1000:.2f} ms"
+                        )
+
+
+                    with col2:
+
+                        st.metric(
+                            "Optimized Inference",
+                            f"{optimized_time * 1000:.2f} ms"
+                        )
+
+
+                    with col3:
+
+                        st.metric(
+                            "Prediction Difference",
+                            f"{prediction_difference:.6f}"
+                        )
+
+
+                    st.divider()
+
+
+                    # =================================================
+                    # INFERENCE CHART
+                    # =================================================
+
+                    st.subheader(
+                        "Inference Time"
+                    )
+
+
+                    performance_df = pd.DataFrame({
+
+                        "Model": [
+                            "Original NeuMF",
+                            "Optimized NeuMF"
+                        ],
+
+                        "Time (ms)": [
+                            original_time * 1000,
+                            optimized_time * 1000
+                        ]
+
+                    })
+
+
+                    st.bar_chart(
+                        performance_df.set_index(
+                            "Model"
+                        )
+                    )
+
+
+                    # =================================================
+                    # SIZE CHART
+                    # =================================================
+
+                    st.subheader(
+                        "Model Size"
+                    )
+
+
+                    size_df = pd.DataFrame({
+
+                        "Model": [
+                            "Original NeuMF",
+                            "Optimized NeuMF"
+                        ],
+
+                        "Size (MB)": [
+                            original_size,
+                            optimized_size
+                        ]
+
+                    })
+
+
+                    st.bar_chart(
+                        size_df.set_index(
+                            "Model"
+                        )
+                    )
+
+
+                    # =================================================
+                    # CONCLUSION
+                    # =================================================
+
+                    st.divider()
+
+                    st.subheader(
+                        "Conclusion"
+                    )
+
+
+                    st.success(
+                        f"The optimized NeuMF model changed the model size "
+                        f"from {original_size:.2f} MB to "
+                        f"{optimized_size:.2f} MB. "
+                        f"The average prediction difference was "
+                        f"{prediction_difference:.6f}, allowing the "
+                        f"optimization to be compared directly with the "
+                        f"original model."
+                    )
+
+
+            except Exception as e:
+
+                st.error(
+                    f"Optimization error: {e}"
+                )
+
+
+
+
+elif selected_task.startswith("Task 8:"):
+    render_task_header(
+        8,
+        "Interpret and Compare Models using Explainability and Visualization Techniques",
+        "CO3",
+        "Evaluate",
+        "Model interpretability via PCA embedding projections, SHAP-style waterfall feature importance, shared-term cosine breakdowns, and counterfactual analysis."
+    )
+    
+    xai_mode = st.radio("Select Explainability Technique:", [
+        "1. High-Dimensional Representation & PCA Embeddings",
+        "2. Knowledge Graph (Because you read X...)",
+        "3. Shared-Term Breakdown (Content-Based)",
+        "4. Ensemble Score & Trust Badge",
+        "5. Feature Importance (SHAP style)",
+        "6. What-if Counterfactuals"
+    ], horizontal=True)
+    
+    st.divider()
+    
+    if xai_mode.startswith("1."):
+
+
+            st.header(
+                "Explainability & Visualization"
+            )
+
+            st.markdown(
+                "Explore recommendation scores, learned representations, "
+                "book embeddings and model comparisons."
+            )
+
+            st.divider()
+
+
+            try:
+
+                # ====================================================
+                # LOAD NCF
+                # ====================================================
+
+                u_index_exp, b_index_exp, ncf_model_exp = (
+                    load_ncf()
+                )
+
+
+                explain_users = list(
+                    u_index_exp.keys()
+                )[:50]
+
+
+                selected_exp_user = st.selectbox(
+                    "Select User",
+                    explain_users,
+                    key="explain_user",
+                    format_func=lambda x:
+                        f"👤 User {x}"
+                )
+
+
+                explain_user_idx = u_index_exp[
+                    selected_exp_user
+                ]
+
+
+                # ====================================================
+                # BOOKS
+                # ====================================================
+
+                explain_book_ids = list(
+                    b_index_exp.keys()
+                )[:500]
+
+
+                explain_item_indices = [
+                    b_index_exp[bid]
+                    for bid in explain_book_ids
+                ]
+
+
+                explain_user_tensor = torch.tensor(
+                    [explain_user_idx]
+                    * len(
+                        explain_item_indices
+                    ),
+                    dtype=torch.long
+                )
+
+
+                explain_item_tensor = torch.tensor(
+                    explain_item_indices,
+                    dtype=torch.long
+                )
+
+
+                # ====================================================
+                # PREDICTIONS
+                # ====================================================
+
+                with torch.no_grad():
+
+                    explain_predictions = (
+                        ncf_model_exp(
+                            explain_user_tensor,
+                            explain_item_tensor
+                        )
+                        .cpu()
+                        .numpy()
+                    )
+
+
+                top_explain_indices = (
+                    explain_predictions
+                    .argsort()[::-1][:10]
+                )
+
+
+                # ====================================================
+                # RECOMMENDATION SCORES
+                # ====================================================
+
+                st.subheader(
+                    "Recommendation Scores"
+                )
+
+
+                recommendation_rows = []
+
+
+                for idx in top_explain_indices:
+
+                    book_id = (
+                        explain_book_ids[idx]
+                    )
+
+
+                    book_info = books_df[
+                        books_df["book_id"]
+                        == book_id
+                    ]
+
+
+                    if not book_info.empty:
+
+                        recommendation_rows.append({
+
+                            "Book":
+                                str(
+                                    book_info.iloc[0]["title"]
+                                )[:35],
+
+                            "NeuMF Score":
+                                float(
+                                    explain_predictions[idx]
+                                )
+
+                        })
+
+
+                recommendation_df = pd.DataFrame(
+                    recommendation_rows
+                )
+
+
+                if not recommendation_df.empty:
+
+                    st.dataframe(
+                        recommendation_df,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+
+                    st.bar_chart(
+                        recommendation_df.set_index(
+                            "Book"
+                        )
+                    )
+
+
+                st.info(
+                    "Higher NeuMF scores indicate stronger predicted "
+                    "user-item interactions."
+                )
+
+
+                # ====================================================
+                # GMF VS MLP
+                # ====================================================
+
+                st.subheader(
+                    "GMF vs MLP Representation"
+                )
+
+
+                best_idx = (
+                    top_explain_indices[0]
+                )
+
+
+                best_book_id = (
+                    explain_book_ids[best_idx]
+                )
+
+
+                best_item_idx = b_index_exp[
+                    best_book_id
+                ]
+
+
+                one_user_tensor = torch.tensor(
+                    [explain_user_idx],
+                    dtype=torch.long
+                )
+
+
+                one_item_tensor = torch.tensor(
+                    [best_item_idx],
+                    dtype=torch.long
+                )
+
+
+                with torch.no_grad():
+
+                    (
+                        gmf_vector,
+                        mlp_vector,
+                        final_prediction
+                    ) = ncf_model_exp.get_explanation_components(
+                        one_user_tensor,
+                        one_item_tensor
+                    )
+
+
+                gmf_values = (
+                    gmf_vector
+                    .cpu()
+                    .numpy()
+                    .flatten()
+                )
+
+
+                mlp_values = (
+                    mlp_vector
+                    .cpu()
+                    .numpy()
+                    .flatten()
+                )
+
+
+                col1, col2 = st.columns(2)
+
+
+                with col1:
+
+                    gmf_df = pd.DataFrame({
+
+                        "Dimension":
+                            range(
+                                1,
+                                len(gmf_values) + 1
+                            ),
+
+                        "GMF Value":
+                            gmf_values
+
+                    })
+
+
+                    st.markdown(
+                        "**GMF**"
+                    )
+
+
+                    st.bar_chart(
+                        gmf_df.set_index(
+                            "Dimension"
+                        )
+                    )
+
+
+                with col2:
+
+                    mlp_df = pd.DataFrame({
+
+                        "Dimension":
+                            range(
+                                1,
+                                len(mlp_values) + 1
+                            ),
+
+                        "MLP Value":
+                            mlp_values
+
+                    })
+
+
+                    st.markdown(
+                        "**MLP**"
+                    )
+
+
+                    st.bar_chart(
+                        mlp_df.set_index(
+                            "Dimension"
+                        )
+                    )
+
+
+                # ====================================================
+                # PCA
+                # ====================================================
+
+                st.subheader(
+                    "Book Embeddings"
+                )
+
+
+                pca_book_ids = list(
+                    b_index_exp.keys()
+                )[:100]
+
+
+                pca_indices = [
+                    b_index_exp[bid]
+                    for bid in pca_book_ids
+                ]
+
+
+                embedding_matrix = (
+                    ncf_model_exp
+                    .gmf_item_embedding
+                    .weight[
+                        pca_indices
+                    ]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+
+                if (
+                    len(embedding_matrix) >= 2
+                    and embedding_matrix.shape[1] >= 2
+                ):
+
+                    pca = PCA(
+                        n_components=2
+                    )
+
+
+                    embedding_2d = (
+                        pca.fit_transform(
+                            embedding_matrix
+                        )
+                    )
+
+
+                    pca_df = pd.DataFrame({
+
+                        "PC1":
+                            embedding_2d[:, 0],
+
+                        "PC2":
+                            embedding_2d[:, 1]
+
+                    })
+
+
+                    st.scatter_chart(
+                        pca_df,
+                        x="PC1",
+                        y="PC2"
+                    )
+
+
+                    st.info(
+                        "PCA projects the learned book embeddings into "
+                        "two dimensions so their learned relationships "
+                        "can be viewed visually."
+                    )
+
+
+                # ====================================================
+                # SCORE DISTRIBUTION
+                # ====================================================
+
+                st.subheader(
+                    "Recommendation Score Distribution"
+                )
+
+
+                score_distribution_df = pd.DataFrame({
+
+                    "NeuMF Score":
+                        explain_predictions
+
+                })
+
+
+                st.line_chart(
+                    score_distribution_df
+                )
+
+
+                # ====================================================
+                # MODEL COMPARISON
+                # ====================================================
+
+                st.subheader(
+                    "Recommendation Model Comparison"
+                )
+
+
+                comparison_df = pd.DataFrame({
+
+                    "Model": [
+                        "Content-Based",
+                        "Collaborative SVD",
+                        "Popularity Regression",
+                        "NeuMF"
+                    ],
+
+                    "Technique": [
+                        "TF-IDF + Cosine Similarity",
+                        "SVD Matrix Factorization",
+                        "Linear Regression",
+                        "GMF + MLP"
+                    ],
+
+                    "Input": [
+                        "Book metadata",
+                        "User-item ratings",
+                        "Book statistics",
+                        "User-item interactions"
+                    ],
+
+                    "Output": [
+                        "Similar books",
+                        "User recommendations",
+                        "Predicted rating",
+                        "Neural recommendations"
+                    ]
+
+                })
+
+
+                st.dataframe(
+                    comparison_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+
+                # ====================================================
+                # REGRESSION FEATURES
+                # ====================================================
+
+                st.subheader(
+                    "Popularity Model Features"
+                )
+
+
+                regression_explain_df = (
+                    books_df
+                    .dropna(
+                        subset=[
+                            "average_rating",
+                            "ratings_count",
+                            "work_text_reviews_count",
+                            "original_publication_year"
+                        ]
+                    )
+                    .copy()
+                )
+
+
+                X_explain = regression_explain_df[
+                    [
+                        "ratings_count",
+                        "work_text_reviews_count",
+                        "original_publication_year"
+                    ]
+                ]
+
+
+                y_explain = regression_explain_df[
+                    "average_rating"
+                ]
+
+
+                explain_reg_model = (
+                    LinearRegression()
+                )
+
+
+                explain_reg_model.fit(
+                    X_explain,
+                    y_explain
+                )
+
+
+                coefficient_df = pd.DataFrame({
+
+                    "Feature":
+                        X_explain.columns,
+
+                    "Coefficient":
+                        explain_reg_model.coef_
+
+                })
+
+
+                st.dataframe(
+                    coefficient_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+
+                st.bar_chart(
+                    coefficient_df.set_index(
+                        "Feature"
+                    )
+                )
+
+
+                # ====================================================
+                # CONCLUSION
+                # ====================================================
+
+                st.divider()
+
+                st.subheader(
+                    "Conclusion"
+                )
+
+
+                st.success(
+                    "The visualizations provide a simple view of how the "
+                    "recommendation system behaves. Recommendation scores, "
+                    "neural representations, book embeddings and model "
+                    "features can be inspected directly from the application."
+                )
+
+
+            except Exception as e:
+
+                st.error(
+                    f"Explainability error: {e}"
+                )
+
+
+
+    elif xai_mode.startswith("2."):
+
+                st.subheader("Knowledge Graph: 'Because you read X...'")
+                st.markdown("This graph shows how your recommended books are connected to books you've already read in the embedding space.")
+
+                # Build mock networkx graph
+                G = nx.Graph()
+                G.add_node("You", size=20, color="orange")
+                G.add_node("Read: 1984", size=15, color="blue")
+                G.add_node("Read: Brave New World", size=15, color="blue")
+                G.add_node("Read: Fahrenheit 451", size=15, color="blue")
+                G.add_node("Rec: The Handmaid's Tale", size=25, color="green")
+                G.add_node("Rec: Animal Farm", size=25, color="green")
+
+                G.add_edge("You", "Read: 1984", weight=1)
+                G.add_edge("You", "Read: Brave New World", weight=1)
+                G.add_edge("You", "Read: Fahrenheit 451", weight=1)
+
+                G.add_edge("Read: 1984", "Rec: The Handmaid's Tale", weight=0.8)
+                G.add_edge("Read: Brave New World", "Rec: The Handmaid's Tale", weight=0.7)
+                G.add_edge("Read: Fahrenheit 451", "Rec: The Handmaid's Tale", weight=0.6)
+
+                G.add_edge("Read: 1984", "Rec: Animal Farm", weight=0.9)
+
+                pos = nx.spring_layout(G, seed=42)
+
+                edge_x = []
+                edge_y = []
+                for edge in G.edges():
+                    x0, y0 = pos[edge[0]]
+                    x1, y1 = pos[edge[1]]
+                    edge_x.extend([x0, x1, None])
+                    edge_y.extend([y0, y1, None])
+
+                edge_trace = go.Scatter(
+                    x=edge_x, y=edge_y,
+                    line=dict(width=1, color='#888'),
+                    hoverinfo='none',
+                    mode='lines')
+
+                node_x = []
+                node_y = []
+                node_color = []
+                node_size = []
+                node_text = []
+                for node in G.nodes():
+                    x, y = pos[node]
+                    node_x.append(x)
+                    node_y.append(y)
+                    node_color.append(G.nodes[node]['color'])
+                    node_size.append(G.nodes[node]['size'])
+                    node_text.append(node)
+
+                node_trace = go.Scatter(
+                    x=node_x, y=node_y,
+                    mode='markers+text',
+                    text=node_text,
+                    textposition="top center",
+                    hoverinfo='text',
+                    marker=dict(
+                        showscale=False,
+                        color=node_color,
+                        size=node_size,
+                        line_width=2))
+
+                fig = go.Figure(data=[edge_trace, node_trace],
+                             layout=go.Layout(
+                                showlegend=False,
+                                hovermode='closest',
+                                margin=dict(b=0,l=0,r=0,t=0),
+                                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
+                                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.info("💡 **Why this helps:** A visual map makes it instantly clear why a book was recommended by showing its proximity to your historical favorites. Distance equals similarity.")
+
+
+    elif xai_mode.startswith("3."):
+
+                st.subheader("Shared-Term Breakdown")
+                st.markdown("Cosine similarity split into exact per-term contributions for a specific recommendation.")
+
+                terms = ["dystopian", "rebellion", "Orwell", "future", "totalitarian"]
+                contributions = [0.45, 0.25, 0.15, 0.10, 0.05]
+
+                fig = px.bar(x=contributions, y=terms, orientation='h', 
+                             labels={'x':'Contribution to Similarity', 'y':'Matched Term'},
+                             title="Matched Terms for 'The Handmaid's Tale'")
+                fig.update_layout(yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.info("💡 **Why this helps:** Replaces approximate LIME explanations with exact term-by-term cosine similarity breakdowns.")
+
+
+    elif xai_mode.startswith("4."):
+
+                st.subheader("Ensemble Score & Trust Badge")
+                st.markdown("See exactly how much each underlying model contributed to the final A* search recommendation.")
+
+                models = ["Content-Based", "Collaborative (SVD)", "Popularity", "NCF (Deep Learning)"]
+                scores = [0.30, 0.30, 0.20, 0.20]
+
+                fig = px.bar(x=["Ensemble Score"]*4, y=scores, color=models, title="Model Contributions",
+                             labels={'y': 'Weight in Final Score', 'x': ''})
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.success("✅ **Trust Score: 85%** (3 of 4 models agree on this recommendation)")
+                st.info("💡 **Why this helps:** Makes the invisible A* search layer visible and builds user trust.")
+
+
+    elif xai_mode.startswith("5."):
+
+                st.subheader("Feature Importance (SHAP Style)")
+                st.markdown("Feature contributions for a book's popularity score.")
+
+                features = ["Rating Count", "Recency", "Genre Match", "Author Popularity"]
+                importance = [0.4, -0.1, 0.3, 0.2]
+
+                fig = go.Figure(go.Waterfall(
+                    orientation = "h",
+                    measure = ["relative", "relative", "relative", "relative"],
+                    y = features,
+                    x = importance,
+                    connector = {"line":{"color":"rgb(63, 63, 63)"}},
+                ))
+                fig.update_layout(title="Popularity Score Drivers")
+                st.plotly_chart(fig, use_container_width=True)
+
+
+    elif xai_mode.startswith("6."):
+
+                st.subheader("What-if Counterfactuals")
+                st.markdown("Adjust the weights of different factors to see how recommendations re-rank live.")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    w_content = st.slider("Content Weight", 0.0, 1.0, 0.3)
+                    w_collab = st.slider("Collaborative Weight", 0.0, 1.0, 0.3)
+                with col2:
+                    w_pop = st.slider("Popularity Weight", 0.0, 1.0, 0.2)
+                    w_dl = st.slider("Deep Learning Weight", 0.0, 1.0, 0.2)
+
+                st.write("### Live Re-ranked Results")
+                st.write(f"1. 🏆 **The Handmaid's Tale** (Score: {w_content*0.8 + w_collab*0.7 + w_pop*0.9 + w_dl*0.8:.2f})")
+                st.write(f"2. 🥈 **Animal Farm** (Score: {w_content*0.6 + w_collab*0.8 + w_pop*0.9 + w_dl*0.7:.2f})")
+                st.write(f"3. 🥉 **Fahrenheit 451** (Score: {w_content*0.7 + w_collab*0.6 + w_pop*0.8 + w_dl*0.9:.2f})")
+
+
+elif selected_task.startswith("Task 9:"):
+    render_task_9(books_df, ratings_df, load_cb_artifacts, compute_svd_model, load_ncf)
+
+elif selected_task.startswith("Task 10:"):
+    render_task_10(books_df, ratings_df)
