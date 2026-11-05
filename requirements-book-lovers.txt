@@ -1,0 +1,10 @@
+streamlit
+pandas
+scikit-learn
+requests
+scipy
+torch
+plotly
+networkx
+shap>=0.45
+lime>=0.2.0.1

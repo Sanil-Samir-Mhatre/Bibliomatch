@@ -5,5 +5,9 @@ __pycache__/
 env/
 venv/
 profile.txt
+.streamlit/secrets.toml
+book_lovers_profiles.sqlite3
+book_lovers_profiles.sqlite3-shm
+book_lovers_profiles.sqlite3-wal
 add_xai.py
 fix_app.py
